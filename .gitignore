@@ -1,0 +1,28 @@
+# Local IDE files and Python caches
+/.idea/
+.vscode/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+.env
+.env.*
+
+# Build output and archived source copy
+/build/
+/dist/
+/原版程序/
+
+# Local settings, appearance, and runtime data
+设置.json
+设置.json.*
+外观资源/
+runtime/
+领取记录.json
+领取记录.json.*
+*.log
+*.stop
+diagnostics/
+preview.png
+detection_check.png
+/程序/collector/assets/*-inspect.png
