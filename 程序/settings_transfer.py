@@ -1,6 +1,7 @@
 """Portable theme and settings archives, with support for older local settings."""
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from hashlib import sha256
 import json
 import os
@@ -87,18 +88,24 @@ def _add_asset(assets, name, content):
         assets[name] = content
 
 
+def _store_asset(assets, resource, folder):
+    content = _read_file(resource, MAX_FILE)
+    name = f'{folder}/{sha256(content).hexdigest()}{resource.suffix.lower()}'
+    _add_asset(assets, name, content)
+    return name
+
+
 def export_bundle(path, root, kind, data):
     assets = {}
 
+    # Reuse resources only within this export; later exports reread changed files.
+    @cache
     def relocate(field, value):
         resource = root / value
         suffix = resource.suffix.lower()
         if suffix not in SUFFIXES[field]:
             raise ValueError(f'不支持分享此资源格式：{resource.name}')
-        content = _read_file(resource, MAX_FILE)
-        name = f'assets/{sha256(content).hexdigest()}{suffix}'
-        _add_asset(assets, name, content)
-        return name
+        return _store_asset(assets, resource, 'assets')
 
     payload = _rewrite(data, relocate, kind)
     manifest = json.dumps(dict(format=FORMAT, version=1, kind=kind, data=payload),
@@ -162,10 +169,7 @@ def _read_legacy(path):
         if not resource.is_relative_to(root) or suffix not in SUFFIXES[field] or not resource.is_file():
             missing += 1
             return appearance.DEFAULTS[field]
-        content = _read_file(resource, MAX_FILE)
-        destination = f'{IMPORT_FOLDER}/{sha256(content).hexdigest()}{suffix}'
-        _add_asset(assets, destination, content)
-        return destination
+        return _store_asset(assets, resource, IMPORT_FOLDER)
 
     data = _rewrite(data, relocate, 'settings')
     return Transfer('settings', data, assets, missing)

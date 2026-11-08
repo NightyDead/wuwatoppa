@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
 import settings_transfer as transfer
@@ -66,3 +67,18 @@ class SettingsTransferTests(unittest.TestCase):
                 data={'presets': {'bad': {'background': '../private.jpg'}}})))
         with self.assertRaisesRegex(ValueError, '无效的资源路径'):
             transfer.read_transfer(bundle)
+
+    def test_shared_resource_read_once_per_export_and_changes_are_not_stale(self):
+        wall = self.root / 'wall.jpg'
+        look = {'background': wall.name}
+        data = {'appearance': look, 'presets': {'one': look, 'two': look}}
+        bundle = self.root / 'settings.zip'
+        for content in (b'first wallpaper', b'changed wallpaper'):
+            wall.write_bytes(content)
+            with patch.object(transfer, '_read_file', wraps=transfer._read_file) as read:
+                transfer.export_bundle(bundle, self.root, 'settings', data)
+            self.assertEqual(read.call_count, 1)
+            imported = transfer.read_transfer(bundle)
+            self.assertEqual(list(imported.assets.values()), [content])
+            self.assertEqual(imported.data['appearance']['background'],
+                             imported.data['presets']['two']['background'])

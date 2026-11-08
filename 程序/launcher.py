@@ -1,6 +1,7 @@
 """One window for the keyboard macro and chest collector."""
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import ctypes
 from ctypes import wintypes
@@ -9,7 +10,9 @@ import os
 from pathlib import Path
 import queue
 import runpy
+import shutil
 import sys
+from threading import Event
 import traceback
 
 from PySide6.QtCore import (QEasingCurve, QPointF, QPropertyAnimation, QRect, QRectF,
@@ -27,8 +30,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
 import appearance
 import settings_transfer
 import ui_theme
+import updater
 from font_support import FontManager, font_choices, font_display_name
-from jobs import (Workers, ROOT, COLLECTOR, SCRIPTS, clicker_options, collector_options,
+from jobs import (Workers, ROOT, COLLECTOR, SCRIPTS,
                   PlanRunner, PLAN_FIELDS, plan_options, step_options, step_summary,
                   read_claim_history, claim_summary, CLAIM_STATUS)
 from ui_state import MonitorState
@@ -37,7 +41,7 @@ from ui_widgets import (Divider, DragFilter, NavItem, NoWheelComboBox, NoWheelSl
 
 NAMES = {'clicker': '连点器', 'collector': '自动领取', 'preview': '识别预览',
          'test': '单次领取', 'check_clicker': '连点器检查', 'check_collector': '领取环境检查'}
-APP_VERSION = '1.1.3'
+APP_VERSION = '1.1.4'
 DEFAULT_VALUES = {'count': '2000', 'interval': '0.1', 'duration': '0',
                   'hours': '6', 'minutes': '15', 'idle': '0', 'idle_interval': '0.1'}
 PAGES = [('clicker', '连点器'), ('collector', '自动领取'), ('plan', '运行计划'),
@@ -108,6 +112,10 @@ class MainWindow(QWidget):
         self.plan = PlanRunner(self.workers)
         self.state = MonitorState()
         self.closing = False
+        self._update_executor = ThreadPoolExecutor(max_workers=1)
+        self._update_stop = Event()
+        self._update_task = None
+        self._update_release = None
         self.awake = False
         self.maximized = False
         self._resizing = None
@@ -293,6 +301,8 @@ class MainWindow(QWidget):
         self.tools_menu.addAction('分享主题…', self.export_theme)
         self.tools_menu.addAction('导出完整设置…', self.export_settings)
         self.tools_menu.addAction('导入主题或设置…', self.import_settings)
+        self.tools_menu.addSeparator()
+        self.update_action = self.tools_menu.addAction('检查更新…', self.check_for_updates)
         self.tools_button.setMenu(self.tools_menu)
 
         self.min_button = WindowButton('min', self.content)
@@ -861,6 +871,76 @@ class MainWindow(QWidget):
         combo.blockSignals(False)
         self.preset_buttons['apply'].setEnabled(bool(self.presets))
         self.preset_buttons['delete'].setEnabled(bool(self.presets))
+
+    def check_for_updates(self):
+        if self.closing or self._update_task is not None:
+            return
+        self.update_action.setEnabled(False)
+        self.set_notice('正在检查 GitHub 更新…')
+        self._update_stop.clear()
+        self._update_task = self._update_executor.submit(
+            updater.check_release, APP_VERSION, self._update_stop)
+
+    def _poll_update(self):
+        if self._update_task is None or not self._update_task.done():
+            return
+        task, self._update_task = self._update_task, None
+        downloading = self._update_release is not None
+        release, self._update_release = self._update_release, None
+        self.update_action.setEnabled(not self.closing)
+        try:
+            result = task.result()
+        except Exception as error:
+            if not self.closing:
+                self.error(f'更新失败：{error}')
+            return
+        if downloading:
+            if self.closing or self.workers.active or self.plan.running:
+                shutil.rmtree(result)
+                if not self.closing:
+                    self.error('请先停止任务，再检查并安装更新。')
+                return
+            exe = Path(sys.executable)
+            try:
+                updater.start_installer(result, exe, ROOT / 'update_install.ps1')
+            except OSError as error:
+                shutil.rmtree(result)
+                self.error(f'无法启动更新器：{error}')
+                return
+            self.request_close()
+            return
+        if self.closing:
+            return
+        release = result
+        if release is None:
+            self.set_notice(f'当前已是最新版本 v{APP_VERSION}。')
+            return
+        exe = Path(sys.executable)
+        if not updater.is_folder_build(exe, ROOT):
+            self.error(f'发现 v{release.version}。请从 GitHub Releases 下载新版文件夹版。')
+            return
+        if self.workers.active or self.plan.running:
+            self.error(f'发现 v{release.version}。请先停止任务，再检查并安装更新。')
+            return
+        message = (f'发现 v{release.version}，更新包约 {release.size / 1024**2:.1f} MiB。'
+                   '\n下载校验后会自动重启助手，保留设置、主题和领取记录。')
+        if release.notes:
+            message += '\n\n' + release.notes
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle('安装更新')
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(message)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        if dialog.exec() != QMessageBox.StandardButton.Yes:
+            self.set_notice('已取消本次更新。')
+            return
+        self._update_stop.clear()
+        self._update_release = release
+        self.update_action.setEnabled(False)
+        self.set_notice(f'正在下载并校验 v{release.version}…')
+        self._update_task = self._update_executor.submit(
+            updater.stage_release, release, exe.parent, self._update_stop)
 
     def _export_transfer(self, kind, data, name):
         file, _ = QFileDialog.getSaveFileName(self, '保存分享包', name, '分享包 (*.zip)')
@@ -1485,6 +1565,7 @@ class MainWindow(QWidget):
         if self.closing:
             return
         self.closing = True
+        self._update_stop.set()
         if self._fade is not None:
             self._fade.stop()
             self._fade = None
@@ -1662,13 +1743,8 @@ class MainWindow(QWidget):
         Deliberately not named ``options``: that attribute holds the appearance
         dict, and a method of the same name would be shadowed by it.
         """
-        if kind == 'clicker':
-            return clicker_options(self.values['count'], self.values['interval'],
-                                   self.values['duration'])
-        if kind == 'collector':
-            return collector_options(self.values['hours'], self.values['minutes'],
-                                     self.values['idle'], self.values['idle_interval'])
-        return []
+        return step_options(dict(self.values, kind=kind)) if kind in PLAN_FIELDS else []
+
 
     def _gap_clicks(self):
         try:
@@ -1920,14 +1996,14 @@ class MainWindow(QWidget):
             self.set_notice(text)
             self.append('领取记录', text)
 
-    def refresh_history(self):
+    def refresh_history(self, *, rows=None):
         if not hasattr(self, 'history_table'):
             return
-        rows = read_claim_history()
+        if rows is None:
+            rows = read_claim_history()
         table = self.history_table
-        table.setRowCount(0)
+        table.setRowCount(len(rows))
         for index, row in enumerate(reversed(rows)):
-            table.insertRow(index)
             values = (row['started_at'][:19].replace('T', ' '),
                       row['finished_at'][:19].replace('T', ' ') or '—',
                       row['count'], CLAIM_STATUS[row['status']])
@@ -1982,6 +2058,7 @@ class MainWindow(QWidget):
         self.tools_menu.actions()[0].setEnabled(not self.closing and not plan_running)
 
     def tick(self):
+        self._poll_update()
         while True:
             try:
                 kind, line = self.workers.messages.get_nowait()
@@ -2005,7 +2082,7 @@ class MainWindow(QWidget):
                 if rows:
                     self.set_notice('上次记录：' + claim_summary(rows[-1]))
                 if self.page == 'history':
-                    self.refresh_history()
+                    self.refresh_history(rows=rows)
             if code == 3:
                 self.append(NAMES[kind], '已按停止请求结束。')
             else:
@@ -2019,7 +2096,8 @@ class MainWindow(QWidget):
         if active != self.awake:
             self.awake = active
             keep_awake(active)
-        if self.closing and not self.workers.active:
+        if self.closing and not self.workers.active and self._update_task is None:
+            self._update_executor.shutdown(wait=False)
             self._tick_timer.stop()
             if self._save_timer.isActive():
                 self._save_timer.stop()
@@ -2101,6 +2179,10 @@ def main():
     window = MainWindow()
     window.show()
     window.start_fade()
+    if token := os.environ.pop('WUWATOPPA_UPDATE_READY', ''):
+        QTimer.singleShot(0, lambda: updater.signal_ready(token))
+    if os.environ.pop('WUWATOPPA_UPDATE_FAILED', ''):
+        window.error('更新失败，已返回旧版。详情请查看程序同级更新临时目录的 install.log。')
     return app.exec()
 
 

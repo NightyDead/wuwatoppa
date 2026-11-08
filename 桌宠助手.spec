@@ -30,6 +30,7 @@ datas = [
     (str(PROG / 'fonts' / 'ARFangXinShuH7GBK.ttf'), 'fonts'),
     (str(PROG / '背景' / '背景.png'), '背景'),
     (str(PROG / '图标.ico'), '.'),
+    (str(PROG / 'update_install.ps1'), '.'),
 ]
 
 excludes = [

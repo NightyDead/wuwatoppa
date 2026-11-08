@@ -68,12 +68,13 @@ def step_options(step):
     """Validate one plan step and return the worker arguments it needs."""
     kind = step.get('kind') if isinstance(step, dict) else None
     if kind == 'clicker':
-        return clicker_options(str(step.get('count', '')), str(step.get('interval', '')),
-                               str(step.get('duration', '')))
-    if kind == 'collector':
-        return collector_options(str(step.get('hours', '')), str(step.get('minutes', '')),
-                                 str(step.get('idle', '')), str(step.get('idle_interval', '')))
-    raise ValueError('计划步骤的任务类型无效。')
+        parser = clicker_options
+    elif kind == 'collector':
+        parser = collector_options
+    else:
+        raise ValueError('计划步骤的任务类型无效。')
+    return parser(*(str(step.get(key, '')) for key in PLAN_FIELDS[kind]))
+
 
 
 def plan_options(step):
@@ -83,17 +84,13 @@ def plan_options(step):
 
 
 def step_summary(step):
-    kind = step.get('kind') if isinstance(step, dict) else None
-    if kind == 'clicker':
-        options = step_options(step)
+    options = step_options(step)
+    if step['kind'] == 'clicker':
         return f"连点 {options[1]} 次 · 间隔 {options[3]} 秒 · 时长 {options[5]} 小时"
-    if kind == 'collector':
-        options = step_options(step)
-        summary = f"监测 {options[1]} 小时 · 每 {float(options[3]) / 60:g} 分钟检查"
-        if len(options) > 4:
-            summary += f" · 间隙连点 {options[5]} 次"
-        return summary
-    raise ValueError('计划步骤的任务类型无效。')
+    summary = f"监测 {options[1]} 小时 · 每 {float(options[3]) / 60:g} 分钟检查"
+    if len(options) > 4:
+        summary += f" · 间隙连点 {options[5]} 次"
+    return summary
 
 
 class PlanRunner:
