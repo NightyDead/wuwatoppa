@@ -1,5 +1,6 @@
 """Match ready chests beside a moving Wuwa Tappo pet. Ctrl+Alt stops the worker."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 import argparse
@@ -126,10 +127,21 @@ class Chest:
     variant: int = None
 
 
-def shift_chest(chest, dx, dy):
-    return replace(chest, x=chest.x+dx, y=chest.y+dy,
-                   anchor_x=None if chest.anchor_x is None else chest.anchor_x+dx,
-                   anchor_y=None if chest.anchor_y is None else chest.anchor_y+dy)
+@dataclass(frozen=True)
+class Anchor:
+    anchor_x: float
+    anchor_y: float
+    scale: float
+    variant: int
+    score: float
+
+
+def shift_match(match, dx, dy):
+    position = dict(anchor_x=None if match.anchor_x is None else match.anchor_x+dx,
+                    anchor_y=None if match.anchor_y is None else match.anchor_y+dy)
+    if isinstance(match, Chest):
+        position.update(x=match.x+dx, y=match.y+dy)
+    return replace(match, **position)
 
 
 @dataclass
@@ -140,14 +152,22 @@ class Observation:
     anchor_visible: bool = False
 
 
+def _contains_box(outer, inner):
+    left, top, right, bottom = inner
+    return (outer[0] <= left < right <= outer[2]
+            and outer[1] <= top < bottom <= outer[3])
+
+
 class PetObserver:
     """Track in physical screen coordinates while capturing only the needed ROI."""
     def __init__(self, detector, desktop):
         self.detector, self.desktop = detector, desktop
+        self.anchor = None
         self.target = None
         self.layout = None
 
     def clear_cache(self):
+        self.anchor = None
         self.target = None
         self.layout = None
         self.detector.clear_cache()
@@ -164,46 +184,99 @@ class PetObserver:
         if bounds != self.desktop.bounds():
             self.clear_cache()
             return None
-        local = shift_chest(target, -origin[0], -origin[1])
+        local = shift_match(target, -origin[0], -origin[1])
         found, visible = self.detector.inspect_near(image, local, max_anchor_shift)
-        physical = [shift_chest(c, *origin) for c in found]
+        physical = [shift_match(c, *origin) for c in found]
+        self.anchor = None
         if visible:
-            self.target = physical[0] if physical else target
+            if physical:
+                self.target = physical[0]
+            self._remember_anchor(origin)
         return Observation(image, origin, physical, visible)
+
+    def _remember_anchor(self, origin):
+        self.anchor = None
+        anchor = self.detector.last_anchor
+        if anchor is not None:
+            anchor = shift_match(anchor, *origin)
+            x, y = self.detector.anchor_center(anchor)
+            if self.desktop.owned_by_pet(round(x), round(y)):
+                self.anchor = self.detector.tracking_hint(anchor, self.target or anchor)
 
     def locate(self, stopped):
         if stopped():
             return None
         bounds = self.desktop.bounds()
-        if self.target is not None and self.layout == bounds:
-            frame = self.recheck(self.target)
+        hint = self.anchor or self.target
+        if hint is not None and self.layout == bounds:
+            frame = self.recheck(hint)
             if stopped():
                 return None
             if frame is not None and frame.anchor_visible:
                 if len(frame.chests) < 2:
                     # 气泡与状态栏图标比例不一致时，局部复查可能只认回一个；
                     # 在同一张局部截图上按所有尺寸重搜一次，别把还在的宝箱当成已领走。
-                    local = shift_chest(self.target, -frame.origin[0], -frame.origin[1])
+                    current = self.anchor or (frame.chests[0] if frame.chests else hint)
+                    local = shift_match(current, -frame.origin[0], -frame.origin[1])
                     found = self.detector.rescan_region(frame.image, local)
                     if len(found) > len(frame.chests):
-                        frame.chests = [shift_chest(c, *frame.origin) for c in found]
+                        frame.chests = [shift_match(c, *frame.origin) for c in found]
                         self.target = frame.chests[0]
+                    self._remember_anchor(frame.origin)
                 return frame
         self.clear_cache()
         if stopped():
             return None
-        box = self.desktop.pet_monitor_bounds()
+        monitor, region = self.desktop.pet_capture_bounds()
         if stopped():
             return None
+        frame = None
+        if region is not None:
+            try:
+                frame = self._find_in(region, bounds, stopped)
+            except (OSError, RuntimeError, ValueError):
+                # The window can move or disappear between enumeration and capture.
+                frame = None
+            if stopped() or bounds != self.desktop.bounds():
+                return None
+            if frame is None or not self._complete_region(frame, region, monitor):
+                frame = None
+                self.detector.clear_cache()
+                monitor = self.desktop.pet_monitor_bounds()
+        if frame is None:
+            if stopped():
+                return None
+            frame = self._find_in(monitor, bounds, stopped)
+        if frame is not None:
+            self.layout = bounds
+            if frame.chests:
+                self.target = frame.chests[0]
+        return frame
+
+    def _find_in(self, box, bounds, stopped):
         image, origin = self.desktop.capture(box)
-        if bounds != self.desktop.bounds():
+        if stopped() or bounds != self.desktop.bounds():
             return None
-        found = self.detector.find(image)
-        physical = [shift_chest(c, *origin) for c in found]
-        self.layout = bounds
-        if physical:
-            self.target = physical[0]
-        return Observation(image, origin, physical, bool(physical))
+        found = [shift_match(chest, *origin) for chest in self.detector.find(image)]
+        return Observation(image, origin, found, bool(found))
+
+    def _complete_region(self, frame, region, monitor):
+        left, top = frame.origin
+        if (left, top, left + frame.image.width, top + frame.image.height) != region:
+            return False
+        chests = frame.chests
+        if len(chests) != 2 or {chest.slot for chest in chests} != {0, 1}:
+            return False
+        # Nearby scales can locate the same menu a few pixels apart.
+        first, second = chests
+        if (first.anchor_x-second.anchor_x)**2 + (first.anchor_y-second.anchor_y)**2 > 3**2:
+            return False
+        for chest in chests:
+            # Account for the wider template search when bubble and menu scales differ.
+            search = self.detector.capture_region(chest, monitor, extra=math.ceil(20*chest.scale)+1)
+            if not _contains_box(region, search) or not self.desktop.owned_by_pet(round(chest.x), round(chest.y)):
+                return False
+        return True
 
 
 def _gray(image):
@@ -256,10 +329,55 @@ def _fast_len(value):
     return best
 
 
+class _NccTemplate:
+    """Fixed artwork with the normalization terms reused by every match."""
+    def __init__(self, pixels):
+        self.shape = pixels.shape
+        self.centered = pixels - pixels.mean()
+        self.energy = (self.centered ** 2).sum()
+
+
+def _conjugate_fft(kernel, shape):
+    spectrum = np.fft.rfft2(kernel, s=shape, axes=(-2, -1))
+    np.conjugate(spectrum, out=spectrum)
+    return spectrum
+
+
+class _TemplateSpectra:
+    """Keep recently used template spectra within a per-detector byte budget."""
+    MAX_ENTRY_BYTES = 2 * 1024**2
+
+    def __init__(self, byte_limit=8 * 1024**2):
+        self.byte_limit = byte_limit
+        self.byte_count = 0
+        self.entries = OrderedDict()
+
+    def get(self, template, shape):
+        key = (template, shape)
+        spectrum = self.entries.get(key)
+        if spectrum is not None:
+            self.entries.move_to_end(key)
+            return spectrum
+        # Skip large spectra so full-frame scans do not evict local matches.
+        # Float64 templates produce complex128 coefficients (16 bytes each).
+        height, width = shape
+        size = height * (width // 2 + 1) * 16
+        if size > min(self.byte_limit, self.MAX_ENTRY_BYTES):
+            return None
+        spectrum = _conjugate_fft(template.centered, shape)
+        while self.byte_count + spectrum.nbytes > self.byte_limit:
+            _, removed = self.entries.popitem(last=False)
+            self.byte_count -= removed.nbytes
+        self.entries[key] = spectrum
+        self.byte_count += spectrum.nbytes
+        return spectrum
+
+
 class _NccFrame:
     """Reuse image transforms across templates within a single search."""
-    def __init__(self, image):
+    def __init__(self, image, template_spectra=None):
         self.image = image
+        self.template_spectra = template_spectra
         self.shape = tuple(_fast_len(length) for length in image.shape)
         self.spectrum = None
         self.integrals = None
@@ -272,9 +390,17 @@ class _NccFrame:
         # Valid shifts never wrap, so the FFT only needs to cover the image.
         if self.spectrum is None:
             self.spectrum = np.fft.rfft2(self.image, s=self.shape, axes=(-2, -1))
-        product = np.fft.rfft2(kernel, s=self.shape, axes=(-2, -1))
-        np.conjugate(product, out=product)
-        product *= self.spectrum
+        cached = None
+        if isinstance(kernel, _NccTemplate):
+            if self.template_spectra is not None:
+                cached = self.template_spectra.get(kernel, self.shape)
+            kernel = kernel.centered
+        if cached is None:
+            product = _conjugate_fft(kernel, self.shape)
+            product *= self.spectrum
+        else:
+            # Multiplication must leave the cached spectrum unchanged.
+            product = cached * self.spectrum
         result = np.fft.irfft2(product, s=self.shape, axes=(-2, -1))
         return np.ascontiguousarray(result[:rows, :cols])
 
@@ -299,13 +425,13 @@ def _ncc(image, template, frame=None):
         return np.empty((0, 0))
     if frame is None:
         frame = _NccFrame(image)
-    centered = template - template.mean()
-    energy = (centered ** 2).sum()
-    scores = frame.correlate(centered)
+    if not isinstance(template, _NccTemplate):
+        template = _NccTemplate(template)
+    scores = frame.correlate(template)
     variance = frame.variance(height, width)
     valid = variance > 1e-5
     np.maximum(variance, 0, out=variance)
-    variance *= energy
+    variance *= template.energy
     np.sqrt(variance, out=variance)
     valid &= variance > 1e-8
     np.divide(scores, variance, out=scores, where=valid)
@@ -326,6 +452,9 @@ class ChestDetector:
         self.chest_fallback = chest_fallback
         self.variants = []
         self._cached = None
+        self.last_anchor = None
+        self._rescan_cache = None
+        self._template_spectra = _TemplateSpectra()
         # 状态栏图标与宝箱气泡未必按同一比例缩小（桌宠大小可调），
         # 这里把每种尺寸的宝箱图样收一份，供当前尺寸没命中时补搜。
         self.chest_catalog = []
@@ -348,7 +477,7 @@ class ChestDetector:
                 def resize(image):
                     size = (max(2, round(image.width * scale)),
                             max(2, round(image.height * scale)))
-                    return _gray(image.resize(size, Image.Resampling.BICUBIC))
+                    return _NccTemplate(_gray(image.resize(size, Image.Resampling.BICUBIC)))
                 chest_gray = [resize(t) for t in templates]
                 self.variants.append((scale, resize(anchor), chest_gray, offsets))
                 self.chest_catalog.append((scale, chest_gray))
@@ -364,8 +493,8 @@ class ChestDetector:
         for percent in range(50, 201, 5):
             scale = percent / 100
             def resize_calibrated(image):
-                return _gray(image.resize((round(image.width*scale), round(image.height*scale)),
-                                          Image.Resampling.BICUBIC))
+                size = round(image.width*scale), round(image.height*scale)
+                return _NccTemplate(_gray(image.resize(size, Image.Resampling.BICUBIC)))
             variant = len(self.variants)
             chest_gray = [resize_calibrated(chest)]
             self.variants.append((scale, resize_calibrated(anchor), chest_gray,
@@ -376,7 +505,7 @@ class ChestDetector:
                 self.coarse.append(variant)
 
     def anchor_present(self, image):
-        frame = _NccFrame(_gray(image))
+        frame = _NccFrame(_gray(image), self._template_spectra)
         for _, anchor, _, _ in self.variants:
             scores = _ncc(frame.image, anchor, frame)
             if scores.size and scores.max() >= self.anchor_threshold:
@@ -385,6 +514,8 @@ class ChestDetector:
 
     def clear_cache(self):
         self._cached = None
+        self.last_anchor = None
+        self._rescan_cache = None
 
     def _region(self, image, target, extra=0):
         return self.capture_region(target, (0, 0, image.width, image.height), extra)
@@ -404,6 +535,7 @@ class ChestDetector:
 
     def inspect_near(self, image, target, max_anchor_shift=None):
         """Reobserve one pet with its known theme/scale; never search globally."""
+        self.last_anchor = None
         if target.variant is None or target.anchor_x is None or target.anchor_y is None:
             return [], False
         scale = target.scale
@@ -412,11 +544,15 @@ class ChestDetector:
         if box[0] >= box[2] or box[1] >= box[3]:
             return [], False
         shift = max(6, 12 * scale) if max_anchor_shift is None else max_anchor_shift
+        anchors = []
         found, visible = self._scan(image, [(target.variant, self.variants[target.variant])],
-                                    box, anchor_hint=(ax, ay, shift))
+                                    box, anchor_hint=(ax, ay, shift), anchors=anchors)
+        if len(anchors) == 1:
+            self.last_anchor = anchors[0]
         if visible:
-            # Keep tracking the menu even when both chests are cooling down.
-            self._cached = (image.size, found[0] if found else target)
+            # A strong, unambiguous menu remains trackable when both slots are empty.
+            hint = found[0] if found else self.last_anchor or target
+            self._cached = (image.size, hint)
         return found, visible
 
     def find(self, image):
@@ -429,11 +565,13 @@ class ChestDetector:
                 if len(extra) > len(found):
                     found = extra
                     self._cached = (image.size, found[0])
+                elif self.last_anchor is not None:
+                    self._cached = (image.size, self.tracking_hint(self.last_anchor, self._cached[1]))
             if visible:
                 return found
         # Movement, scale/theme changes and display changes invalidate the hint.
         self.clear_cache()
-        frame = _NccFrame(_gray(image))
+        frame = _NccFrame(_gray(image), self._template_spectra)
         found = self._find_calibrated(image, frame)
         if not found:
             found = self._scan_scales(image, frame)
@@ -441,11 +579,56 @@ class ChestDetector:
             self._cached = (image.size, found[0])
         return found
 
+    def anchor_center(self, anchor):
+        height, width = self.variants[anchor.variant][1].shape
+        return anchor.anchor_x + width/2, anchor.anchor_y + height/2
+
+    def tracking_hint(self, anchor, target):
+        # Strong menu evidence updates position. Keep the last chest's search
+        # geometry until another chest is found: equivalent menu templates can
+        # use different scale conventions and unnecessarily enlarge the ROI.
+        x, y = self.anchor_center(anchor)
+        height, width = self.variants[target.variant][1].shape
+        return Anchor(x-width/2, y-height/2, target.scale, target.variant, anchor.score)
+
+    def _choose_anchor(self, anchors, target):
+        if not anchors:
+            return None
+        best = max(anchors, key=lambda anchor: anchor.score)
+        bx, by = self.anchor_center(best)
+        tx, ty = self.anchor_center(target)
+        if (bx-tx)**2 + (by-ty)**2 > max(6, 12*target.scale)**2:
+            return None
+        # Different templates may have different top-left corners for the same
+        # menu. Only one cluster of strong matches can update the tracking hint.
+        if any((x-bx)**2 + (y-by)**2 > 3**2
+               for x, y in map(self.anchor_center, anchors)):
+            return None
+        return best
+
     def rescan_region(self, image, target, extra=40):
-        """Re-scan the menu's neighbourhood at every scale."""
-        found, _ = self._scan(image, enumerate(self.variants),
-                              self._region(image, target,
-                                           extra=math.ceil(extra*target.scale)))
+        """Reuse a complete multi-scale search only when all input pixels match."""
+        box = self._region(image, target, extra=math.ceil(extra*target.scale))
+        region = image.crop(box).convert('L')
+        signature = (region.size, self.anchor_threshold, self.anchor_floor,
+                     self.chest_threshold, self.chest_fallback)
+        # One grayscale byte per pixel, capped at 1 MiB. Pixel changes (timer
+        # digits, newly ready chests, occlusion) always trigger another search.
+        pixels = region.tobytes() if region.width*region.height <= 1024**2 else None
+        if pixels is not None and self._rescan_cache is not None:
+            previous_signature, previous_pixels, previous_found, previous_anchors = self._rescan_cache
+            if signature == previous_signature and pixels == previous_pixels:
+                anchors = [shift_match(anchor, *box[:2]) for anchor in previous_anchors]
+                self.last_anchor = self._choose_anchor(anchors, target)
+                return [shift_match(chest, *box[:2]) for chest in previous_found]
+        anchors = []
+        found, _ = self._scan(image, enumerate(self.variants), box,
+                              frame=_NccFrame(_gray(region), self._template_spectra), anchors=anchors)
+        self.last_anchor = self._choose_anchor(anchors, target)
+        self._rescan_cache = None if pixels is None else (
+            signature, pixels,
+            tuple(shift_match(chest, -box[0], -box[1]) for chest in found),
+            tuple(shift_match(anchor, -box[0], -box[1]) for anchor in anchors))
         return found
 
     def _scan_scales(self, image, frame, enough=2):
@@ -488,7 +671,7 @@ class ChestDetector:
                 break
         return self._unique(candidates)
 
-    def _scan(self, image, variants, box=None, anchor_hint=None, frame=None):
+    def _scan(self, image, variants, box=None, anchor_hint=None, frame=None, anchors=None):
         left_origin, top_origin = (0, 0) if box is None else box[:2]
         gray = frame.image if frame is not None else _gray(image if box is None else image.crop(box))
         xmin = ymin = 0
@@ -508,9 +691,10 @@ class ChestDetector:
             # Chest matching still uses the original, wider region.
             height = max(anchor.shape[0] for _, (_, anchor, _, _) in variants)
             width = max(anchor.shape[1] for _, (_, anchor, _, _) in variants)
-            frame = _NccFrame(gray[ymin:ymax+height-1, xmin:xmax+width-1])
+            frame = _NccFrame(gray[ymin:ymax+height-1, xmin:xmax+width-1],
+                              self._template_spectra)
         elif frame is None:
-            frame = _NccFrame(gray)
+            frame = _NccFrame(gray, self._template_spectra)
 
         candidates = []
         visible = False
@@ -530,6 +714,9 @@ class ChestDetector:
                        max(0, ax-radius):ax+radius+1] = -1
                 ay += ymin
                 ax += xmin
+                if strict and anchors is not None:
+                    anchors.append(Anchor(left_origin + ax, top_origin + ay,
+                                          scale, variant, anchor_score))
                 # Offsets are relative to the stable status-bar menu icon.
                 for slot, (dx, dy) in enumerate(offsets):
                     cx, cy = ax + dx * scale, ay + dy * scale
@@ -582,7 +769,7 @@ class ChestDetector:
         y0 = min(top for _, _, top, _, _ in searches)
         x1 = max(right for _, _, _, right, _ in searches)
         y1 = max(bottom for _, _, _, _, bottom in searches)
-        frame = _NccFrame(gray[y0:y1, x0:x1])
+        frame = _NccFrame(gray[y0:y1, x0:x1], self._template_spectra)
         for template, left, top, right, bottom in searches:
             th, tw = template.shape
             scores = _ncc(frame.image, template, frame)
@@ -688,6 +875,14 @@ class WindowsDesktop:
         api.MonitorFromWindow.restype = wintypes.HANDLE
         api.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
         api.GetMonitorInfoW.restype = wintypes.BOOL
+        try:
+            self._window_attribute = ctypes.windll.dwmapi.DwmGetWindowAttribute
+        except (AttributeError, OSError):
+            self._window_attribute = None
+        else:
+            self._window_attribute.argtypes = [
+                wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+            self._window_attribute.restype = ctypes.c_long
         self.kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
         self.kernel32.CreateMutexW.restype = wintypes.HANDLE
         expected_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
@@ -772,9 +967,9 @@ class WindowsDesktop:
     def pet_processes(self):
         return sorted({pid for _, pid in self.pet_windows()})
 
-    def pet_monitor_bounds(self):
-        """Locate the pet's main window, with a fallback for unknown window titles."""
-        main_monitors = set()
+    def _pet_display(self):
+        """Return the selected monitor and, when unambiguous, the main HWND."""
+        main_windows = []
         monitors = set()
         title = ctypes.create_unicode_buffer(256)
         for hwnd, _ in self.pet_windows():
@@ -787,15 +982,39 @@ class WindowsDesktop:
             # Helper windows can stay on the original display when the pet moves.
             if (self.user32.GetWindowTextW(hwnd, title, len(title))
                     and title.value.strip().casefold() == 'wuwa tappo'):
-                main_monitors.add(monitor)
-        monitors = main_monitors or monitors
+                main_windows.append((hwnd, monitor))
+        monitors = {monitor for _, monitor in main_windows} or monitors
         if len(monitors) != 1:
-            return None
+            return None, None
         info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
         if not self.user32.GetMonitorInfoW(monitors.pop(), ctypes.byref(info)):
-            return None
+            return None, None
         rect = info.rcMonitor
-        return rect.left, rect.top, rect.right, rect.bottom
+        hwnd = main_windows[0][0] if len(main_windows) == 1 else None
+        return (rect.left, rect.top, rect.right, rect.bottom), hwnd
+
+    def pet_monitor_bounds(self):
+        return self._pet_display()[0]
+
+    def pet_capture_bounds(self):
+        monitor, hwnd = self._pet_display()
+        if hwnd is None or self._window_attribute is None:
+            return monitor, None
+        rect = wintypes.RECT()
+        # DWMWA_EXTENDED_FRAME_BOUNDS returns physical screen coordinates.
+        if self._window_attribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+            return monitor, None
+        if not _contains_box(monitor, (rect.left, rect.top, rect.right, rect.bottom)):
+            return monitor, None
+        left, top, right, bottom = monitor
+        # The chest bubbles are above and to the side of the menu. Leave space
+        # for their largest supported scale even when a bubble is a separate window.
+        region = (max(left, rect.left-128), max(top, rect.top-320),
+                  min(right, rect.right+208), min(bottom, rect.bottom+160))
+        width, height = region[2]-region[0], region[3]-region[1]
+        if 2 * width * height >= (right-left) * (bottom-top):
+            return monitor, None
+        return monitor, region
 
     def elevated(self, pid=None):
         """Whether this helper (or ``pid``) runs elevated; None when unknown."""
@@ -1003,7 +1222,7 @@ def main():
     if args.stop_file is not None and args.stop_file.exists():
         stop.set()
     print(f'自动领取 v{VERSION} 已开始；按 Ctrl+Alt 停止。无需固定桌宠位置。', flush=True)
-    print('首次全屏定位；之后只截图桌宠附近，局部定位失效后再全屏查找。', flush=True)
+    print('首次定位优先搜索桌宠窗口附近；局部结果不完整时再搜索所在屏幕。', flush=True)
     print('每轮最多处理当前两个宝箱；每个宝箱最多尝试 5 次（含第一次）。', flush=True)
     if args.once:
         print('单次测试：测试后鼠标保留在目标位置，方便确认实际点在哪里。', flush=True)

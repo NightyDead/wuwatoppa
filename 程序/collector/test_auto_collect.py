@@ -47,6 +47,29 @@ class DetectionTests(unittest.TestCase):
                         np.linalg.norm(normalized) * np.linalg.norm(centered))
                     self.assertAlmostEqual(scores[y, x], expected, places=10)
 
+    def test_template_spectrum_cache_preserves_scores_across_frames_and_eviction(self):
+        rng = np.random.default_rng(37)
+        pixels = [rng.random((5, 7)), rng.random((5, 7))]
+        templates = [auto_collect._NccTemplate(template) for template in pixels]
+        cache = auto_collect._TemplateSpectra(byte_limit=3000)
+        cases = ((0, (12, 12)), (0, (12, 12)), (1, (12, 12)),
+                 (0, (14, 14)), (0, (12, 12)), (0, (20, 24)))
+        images = [rng.random(shape) for _, shape in cases]
+        expected = [auto_collect._ncc(image, pixels[index])
+                    for (index, _), image in zip(cases, images)]
+        with patch.object(auto_collect, '_conjugate_fft',
+                          wraps=auto_collect._conjugate_fft) as transform:
+            for (index, shape), image, scores in zip(cases, images, expected):
+                with self.subTest(index=index, shape=shape):
+                    frame = auto_collect._NccFrame(image, cache)
+                    np.testing.assert_array_equal(auto_collect._ncc(image, templates[index], frame), scores)
+                    self.assertLessEqual(cache.byte_count, cache.byte_limit)
+            # The second image reuses the first template. The changed shape
+            # evicts earlier spectra, and the oversized spectrum stays uncached.
+            self.assertEqual(transform.call_count, 5)
+        self.assertEqual(cache.byte_count, sum(spectrum.nbytes for spectrum in cache.entries.values()))
+        self.assertNotIn((templates[0], (20, 24)), cache.entries)
+
     def test_ready_reference_has_two_chests(self):
         found = sorted(self.detector.find(self.ready), key=lambda c: c.y)
         self.assertEqual(len(found), 2)
@@ -386,6 +409,7 @@ class ClickGuardTests(unittest.TestCase):
 
 class FakeDetector:
     def __init__(self, frames, anchor_visible=True):
+        self.last_anchor = None
         self.frames = iter(frames)
         self.anchor_visible = anchor_visible
         self.full_searches = 0
@@ -422,6 +446,9 @@ class FakeDesktop:
     def pet_monitor_bounds(self):
         return self.monitor_box
 
+    def pet_capture_bounds(self):
+        return self.monitor_box, getattr(self, 'window_region', None)
+
     def capture(self, box=None):
         return None, (-100, 20)
 
@@ -436,7 +463,7 @@ class FakeDesktop:
 
 
 class PetMonitorTests(unittest.TestCase):
-    def locate(self, windows):
+    def make_desktop(self, windows):
         desktop = WindowsDesktop.__new__(WindowsDesktop)
         desktop.pet_windows = lambda: [(hwnd, 10) for hwnd in windows]
         desktop.user32 = unittest.mock.Mock()
@@ -455,7 +482,36 @@ class PetMonitorTests(unittest.TestCase):
 
         desktop.user32.GetWindowTextW.side_effect = get_title
         desktop.user32.GetMonitorInfoW.side_effect = get_monitor_info
-        return desktop.pet_monitor_bounds()
+        return desktop
+
+    def locate(self, windows):
+        return self.make_desktop(windows).pet_monitor_bounds()
+
+    def test_window_region_preserves_negative_coordinates_and_ignores_helpers(self):
+        desktop = self.make_desktop({101: (1, 'Wuwa Tappo'), 102: (2, 'Helper')})
+        def get_rect(hwnd, attribute, pointer, size):
+            self.assertEqual((hwnd, attribute), (101, 9))
+            rect = pointer._obj
+            rect.left, rect.top, rect.right, rect.bottom = -2010, 790, -1850, 1010
+            return 0
+        desktop._window_attribute = unittest.mock.Mock(side_effect=get_rect)
+        self.assertEqual(desktop.pet_capture_bounds(),
+                         ((-3840, 0, 0, 2160), (-2138, 470, -1642, 1170)))
+
+    def test_ambiguous_or_cross_screen_window_uses_monitor(self):
+        monitor = (-3840, 0, 0, 2160)
+        desktop = self.make_desktop({101: (1, 'Wuwa Tappo'), 102: (1, 'Wuwa Tappo')})
+        desktop._window_attribute = unittest.mock.Mock()
+        self.assertEqual(desktop.pet_capture_bounds(), (monitor, None))
+        desktop._window_attribute.assert_not_called()
+
+        desktop = self.make_desktop({101: (1, 'Wuwa Tappo')})
+        def crosses_display(hwnd, attribute, pointer, size):
+            rect = pointer._obj
+            rect.left, rect.top, rect.right, rect.bottom = -100, 200, 25, 380
+            return 0
+        desktop._window_attribute = crosses_display
+        self.assertEqual(desktop.pet_capture_bounds(), (monitor, None))
 
     def test_main_window_follows_pet_across_displays(self):
         self.assertEqual(self.locate({101: (2, 'Wuwa Tappo'), 102: (2, '')}),
@@ -469,6 +525,99 @@ class PetMonitorTests(unittest.TestCase):
 
 
 class RegionObservationTests(unittest.TestCase):
+    def make_state_tracker(self):
+        with Image.open(ASSETS / 'ready_reference.png') as source:
+            ready = source.convert('RGB')
+        with Image.open(ASSETS / 'cooldown_reference.png') as source:
+            cooldown = source.convert('RGB')
+        desktop = ScreenshotDesktop(Image.new('RGB', (700, 450)), (-800, -200))
+
+        def show(slots, dx=0):
+            pet = ready.copy()
+            for slot, box in enumerate(((118, 43, 163, 78), (112, 79, 163, 104))):
+                if slot not in slots:
+                    pet.paste(cooldown.crop(box), box)
+            desktop.image = Image.new('RGB', (700, 450), '#35405c')
+            desktop.image.paste(pet, (150+dx, 100))
+
+        show({0, 1})
+        return auto_collect.PetObserver(ChestDetector(), desktop), desktop, show
+
+    def test_cooling_pet_follows_movement_and_recovers_each_slot_immediately(self):
+        observer, desktop, show = self.make_state_tracker()
+        self.assertEqual({c.slot for c in observer.locate(lambda: False).chests}, {0, 1})
+        for dx in range(0, 31, 3):
+            show(set(), dx)
+            frame = observer.locate(lambda: False)
+            self.assertEqual(frame.chests, [])
+            self.assertTrue(frame.anchor_visible)
+            self.assertIsNotNone(observer.anchor)
+        for slots in ({1}, {0}, {0, 1}):
+            show(slots, 30)
+            frame = observer.locate(lambda: False)
+            self.assertEqual({c.slot for c in frame.chests}, slots)
+            for chest in frame.chests:
+                x, y = ((139, 61), (132, 92))[chest.slot]
+                self.assertAlmostEqual(chest.x, -800+180+x, delta=4)
+                self.assertAlmostEqual(chest.y, -200+100+y, delta=4)
+        self.assertEqual(desktop.requests.count(None), 1)
+
+    def test_unowned_strong_anchor_is_not_retained_during_cooldown(self):
+        observer, desktop, show = self.make_state_tracker()
+        observer.locate(lambda: False)
+        show(set())
+        observer.locate(lambda: False)
+        self.assertIsNotNone(observer.anchor)
+        desktop.owned_by_pet = lambda x, y: False
+        observer.locate(lambda: False)
+        self.assertIsNotNone(observer.detector.last_anchor)
+        self.assertIsNone(observer.anchor)
+
+    def test_ambiguous_rescan_discards_preliminary_anchor(self):
+        observer, desktop, show = self.make_state_tracker()
+        observer.locate(lambda: False)
+        show(set())
+
+        def inspect(image, target, max_anchor_shift=None):
+            observer.detector.last_anchor = auto_collect.Anchor(
+                target.anchor_x, target.anchor_y, target.scale, target.variant, 0.99)
+            return [], True
+
+        def rescan(image, target):
+            self.assertIsNotNone(observer.anchor)
+            observer.detector.last_anchor = None  # Broader search cannot identify one menu.
+            return []
+
+        with patch.object(observer.detector, 'inspect_near', side_effect=inspect), \
+                patch.object(observer.detector, 'rescan_region', side_effect=rescan):
+            observer.locate(lambda: False)
+        self.assertIsNone(observer.anchor)
+
+    def test_cooldown_anchor_is_cleared_after_occlusion_and_display_change(self):
+        observer, desktop, show = self.make_state_tracker()
+        observer.locate(lambda: False)
+        show(set())
+        observer.locate(lambda: False)
+        self.assertIsNotNone(observer.anchor)
+        desktop.image.paste('#35405c', (0, 0, 700, 450))
+        self.assertEqual(observer.locate(lambda: False).chests, [])
+        self.assertIsNone(observer.anchor)
+        self.assertIsNone(observer.target)
+        show({0, 1})
+        self.assertEqual({c.slot for c in observer.locate(lambda: False).chests}, {0, 1})
+        show(set())
+        observer.locate(lambda: False)
+        self.assertIsNotNone(observer.anchor)
+        desktop.origin = (-1600, -200)
+        show({0, 1}, 120)
+        frame = observer.locate(lambda: False)
+        self.assertIsNone(desktop.requests[-1])
+        self.assertEqual({c.slot for c in frame.chests}, {0, 1})
+        for chest in frame.chests:
+            x, y = ((139, 61), (132, 92))[chest.slot]
+            self.assertAlmostEqual(chest.x, -1600+270+x, delta=4)
+            self.assertAlmostEqual(chest.y, -200+100+y, delta=4)
+
     def make_tracker(self, origin=(0, 0)):
         image = Image.new('RGB', (700, 600), '#35405c')
         with Image.open(Path(__file__).parent / 'test_fixtures' / 'software_100.png') as pet:
@@ -540,6 +689,61 @@ class RegionObservationTests(unittest.TestCase):
         self.assertAlmostEqual(upper.y, 0, delta=2)
         self.assertEqual([(c.x, c.y) for c in first.chests],
                          [(c.x, c.y) for c in second.chests])
+
+    def test_window_capture_matches_monitor_detection_and_uses_physical_coordinates(self):
+        baseline, desktop = self.make_tracker(origin=(-800, -200))
+        desktop.monitor_box = desktop.bounds()
+        expected = baseline.locate(lambda: False).chests
+        desktop.requests.clear()
+        desktop.window_region = (-680, -160, -350, 180)
+        observer = auto_collect.PetObserver(ChestDetector(), desktop)
+        frame = observer.locate(lambda: False)
+        self.assertEqual(desktop.requests, [desktop.window_region])
+        self.assertEqual(frame.origin, desktop.window_region[:2])
+        self.assertEqual([(c.x, c.y, c.slot) for c in frame.chests],
+                         [(c.x, c.y, c.slot) for c in expected])
+        np.testing.assert_allclose([c.score for c in frame.chests],
+                                   [c.score for c in expected], atol=1e-12, rtol=0)
+
+    def test_incomplete_or_unowned_window_result_falls_back_to_current_monitor(self):
+        for region, owned in (((120, 220, 450, 380), True),
+                              ((120, 40, 450, 380), False)):
+            with self.subTest(region=region, owned=owned):
+                observer, desktop = self.make_tracker()
+                desktop.monitor_box = desktop.bounds()
+                desktop.window_region = region
+                desktop.owned_by_pet = lambda x, y: owned
+                frame = observer.locate(lambda: False)
+                self.assertEqual(desktop.requests, [region, desktop.monitor_box])
+                self.assertEqual({c.slot for c in frame.chests}, {0, 1})
+
+    def test_window_crop_at_chest_search_edge_falls_back_even_with_two_slots(self):
+        observer, desktop = self.make_tracker()
+        desktop.monitor_box = desktop.bounds()
+        # The fixture itself has both chests, but cropping to its edges
+        # truncates the surrounding search needed for alternate bubble sizes.
+        desktop.window_region = (230, 160, 350, 340)
+        image = desktop.image.crop(desktop.window_region)
+        self.assertEqual({c.slot for c in ChestDetector().find(image)}, {0, 1})
+        frame = observer.locate(lambda: False)
+        self.assertEqual(desktop.requests, [desktop.window_region, desktop.monitor_box])
+        self.assertEqual({c.slot for c in frame.chests}, {0, 1})
+
+    def test_window_move_during_capture_reloads_monitor_for_fallback(self):
+        observer, desktop = self.make_tracker()
+        desktop.monitor_box = (0, 0, 210, 600)
+        desktop.window_region = (10, 20, 190, 290)
+        capture = desktop.capture
+
+        def capture_after_move(box):
+            if box == desktop.window_region:
+                desktop.monitor_box = (210, 0, 700, 600)
+            return capture(box)
+
+        desktop.capture = capture_after_move
+        frame = observer.locate(lambda: False)
+        self.assertEqual(desktop.requests, [desktop.window_region, desktop.monitor_box])
+        self.assertEqual({c.slot for c in frame.chests}, {0, 1})
 
     def test_known_monitor_without_chests_does_not_capture_other_displays(self):
         observer, desktop = self.make_tracker()
@@ -684,6 +888,9 @@ class ScreenshotDesktop:
 
     def pet_monitor_bounds(self):
         return self.monitor_box
+
+    def pet_capture_bounds(self):
+        return self.monitor_box, getattr(self, 'window_region', None)
 
     def capture(self, box=None):
         self.requests.append(box)

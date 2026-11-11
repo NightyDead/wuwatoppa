@@ -1,6 +1,6 @@
 # 桌宠助手 · WuwaToppa
 
-适用于 Windows 的 **Wuwa Tappo** 桌宠助手，提供 F15 连点、宝箱自动领取和顺序运行计划。当前版本为 **1.1.4**，版本号可在窗口底部查看。
+适用于 Windows 的 **Wuwa Tappo** 桌宠助手，提供 F15 连点、宝箱自动领取和顺序运行计划。当前版本为 **1.1.5**，版本号可在窗口底部查看。
 
 ## 快速开始
 
@@ -43,6 +43,8 @@ python -m venv .venv
 
 ## 应用内更新
 
+「工具 → 启动时自动检查更新」可开启启动检查，默认关闭，选择会保存。开启后每次启动在后台检查，只有发现新版才弹窗，显示当前版本、最新版本和更新日志；无新版或网络失败不会弹窗。关闭后仍可手动检查。弹窗选择「暂不更新」会继续使用当前版本，选择「更新并重启」才开始下载。运行任务时请先停止任务再安装。
+
 在 Windows 文件夹版中选择「工具 → 检查更新」。确认后，助手会从 GitHub 下载新版并校验
 SHA-256，退出后替换程序并重新启动。安装前请先停止任务。设置、主题资源和领取记录会保留。
 源码版和单文件版可以检查更新，安装时使用新的完整文件夹版。1.1.3 及更早版本需先手动升级一次。
@@ -50,12 +52,12 @@ SHA-256，退出后替换程序并重新启动。安装前请先停止任务。�
 检查时遇到临时断线或超时会自动重试，最多请求 3 次。若提示连接中断，请检查网络和系统代理；
 若提示 HTTP 404，表示尚无可用的更新清单，需由发布者上传 `update.json`，这不代表已经是最新版。
 
-发布更新时，给 GitHub Release 使用形如 `v1.1.4` 的标签，上传
-`desktop-pet-assistant-1.1.4.zip`（ZIP 顶层为 `桌宠助手`，且只含干净的发布文件），
+发布更新时，给 GitHub Release 使用形如 `v1.1.5` 的标签，上传
+`desktop-pet-assistant-1.1.5.zip`（ZIP 顶层为 `桌宠助手`，且只含干净的发布文件），
 再上传由以下命令生成的 `update.json`。正式发行版应设为 Latest。
 
 ```powershell
-.\.venv\Scripts\python.exe .\程序\updater.py 1.1.4 .\dist\desktop-pet-assistant-1.1.4.zip --output .\dist\update.json
+.\.venv\Scripts\python.exe .\程序\updater.py 1.1.5 .\dist\desktop-pet-assistant-1.1.5.zip --output .\dist\update.json
 ```
 
 ## 构建 Windows EXE

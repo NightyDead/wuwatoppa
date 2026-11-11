@@ -41,7 +41,7 @@ from ui_widgets import (Divider, DragFilter, NavItem, NoWheelComboBox, NoWheelSl
 
 NAMES = {'clicker': '连点器', 'collector': '自动领取', 'preview': '识别预览',
          'test': '单次领取', 'check_clicker': '连点器检查', 'check_collector': '领取环境检查'}
-APP_VERSION = '1.1.4'
+APP_VERSION = '1.1.5'
 DEFAULT_VALUES = {'count': '2000', 'interval': '0.1', 'duration': '0',
                   'hours': '6', 'minutes': '15', 'idle': '0', 'idle_interval': '0.1'}
 PAGES = [('clicker', '连点器'), ('collector', '自动领取'), ('plan', '运行计划'),
@@ -116,6 +116,7 @@ class MainWindow(QWidget):
         self._update_stop = Event()
         self._update_task = None
         self._update_release = None
+        self._update_automatic = False
         self.awake = False
         self.maximized = False
         self._resizing = None
@@ -161,6 +162,7 @@ class MainWindow(QWidget):
         self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self.tick)
         self._tick_timer.start(100)
+        QTimer.singleShot(1000, self._check_startup_update)
 
     # ---------------------------------------------------------------- 设置与度量
 
@@ -249,6 +251,7 @@ class MainWindow(QWidget):
     def _business(self):
         data = {key: self.values.get(key, '') for key in DEFAULT_VALUES}
         data['plan'] = self.plan_steps
+        data['auto_check_updates'] = self.auto_update_action.isChecked()
         return data
 
     def save(self):
@@ -303,6 +306,10 @@ class MainWindow(QWidget):
         self.tools_menu.addAction('导入主题或设置…', self.import_settings)
         self.tools_menu.addSeparator()
         self.update_action = self.tools_menu.addAction('检查更新…', self.check_for_updates)
+        self.auto_update_action = self.tools_menu.addAction('启动时自动检查更新')
+        self.auto_update_action.setCheckable(True)
+        self.auto_update_action.setChecked(self.saved_settings.get('auto_check_updates') is True)
+        self.auto_update_action.toggled.connect(lambda checked: self.save())
         self.tools_button.setMenu(self.tools_menu)
 
         self.min_button = WindowButton('min', self.content)
@@ -872,11 +879,17 @@ class MainWindow(QWidget):
         self.preset_buttons['apply'].setEnabled(bool(self.presets))
         self.preset_buttons['delete'].setEnabled(bool(self.presets))
 
-    def check_for_updates(self):
+    def _check_startup_update(self):
+        if self.auto_update_action.isChecked():
+            self.check_for_updates(automatic=True)
+
+    def check_for_updates(self, *, automatic=False):
         if self.closing or self._update_task is not None:
             return
         self.update_action.setEnabled(False)
-        self.set_notice('正在检查 GitHub 更新…')
+        self._update_automatic = automatic
+        if not automatic:
+            self.set_notice('正在检查 GitHub 更新…')
         self._update_stop.clear()
         self._update_task = self._update_executor.submit(
             updater.check_release, APP_VERSION, self._update_stop)
@@ -885,6 +898,7 @@ class MainWindow(QWidget):
         if self._update_task is None or not self._update_task.done():
             return
         task, self._update_task = self._update_task, None
+        automatic, self._update_automatic = self._update_automatic, False
         downloading = self._update_release is not None
         release, self._update_release = self._update_release, None
         self.update_action.setEnabled(not self.closing)
@@ -892,7 +906,10 @@ class MainWindow(QWidget):
             result = task.result()
         except Exception as error:
             if not self.closing:
-                self.error(f'更新失败：{error}')
+                if automatic:
+                    self.append('助手', f'自动检查更新失败：{error}')
+                else:
+                    self.error(f'更新失败：{error}')
             return
         if downloading:
             if self.closing or self.workers.active or self.plan.running:
@@ -913,7 +930,23 @@ class MainWindow(QWidget):
             return
         release = result
         if release is None:
-            self.set_notice(f'当前已是最新版本 v{APP_VERSION}。')
+            if not automatic:
+                self.set_notice(f'当前已是最新版本 v{APP_VERSION}。')
+            return
+        message = (f'当前版本：v{APP_VERSION}\n最新版本：v{release.version}'
+                   f'\n更新包约 {release.size / 1024**2:.1f} MiB。'
+                   '\n下载校验后会自动重启助手，保留设置、主题和领取记录。')
+        message += '\n\n更新日志：\n' + (release.notes.strip() or '此版本未提供更新日志。')
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle('安装更新')
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(message)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.button(QMessageBox.StandardButton.Yes).setText('更新并重启')
+        dialog.button(QMessageBox.StandardButton.No).setText('暂不更新')
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        if dialog.exec() != QMessageBox.StandardButton.Yes:
+            self.set_notice('已取消本次更新。')
             return
         exe = Path(sys.executable)
         if not updater.is_folder_build(exe, ROOT):
@@ -921,19 +954,6 @@ class MainWindow(QWidget):
             return
         if self.workers.active or self.plan.running:
             self.error(f'发现 v{release.version}。请先停止任务，再检查并安装更新。')
-            return
-        message = (f'发现 v{release.version}，更新包约 {release.size / 1024**2:.1f} MiB。'
-                   '\n下载校验后会自动重启助手，保留设置、主题和领取记录。')
-        if release.notes:
-            message += '\n\n' + release.notes
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle('安装更新')
-        dialog.setTextFormat(Qt.TextFormat.PlainText)
-        dialog.setText(message)
-        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        dialog.setDefaultButton(QMessageBox.StandardButton.No)
-        if dialog.exec() != QMessageBox.StandardButton.Yes:
-            self.set_notice('已取消本次更新。')
             return
         self._update_stop.clear()
         self._update_release = release
